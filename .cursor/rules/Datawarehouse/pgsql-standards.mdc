@@ -1,0 +1,396 @@
+---
+globs: "**/*.sql"
+description: 提供 PostgreSQL SQL 特定的实现方式，包括 DELETE+INSERT 幂等、UPSERT、历史继承模式。适用于编写 PostgreSQL SQL 脚本的场景。
+---
+
+# PostgreSQL SQL Standards
+
+## 概述
+
+本 Skill 提供 PostgreSQL 特定的实现方式，包括 DELETE+INSERT 幂等、UPSERT、历史继承模式。
+
+---
+
+## PostgreSQL 特性
+
+| 特性 | 说明 |
+|------|------|
+| 表分区 | 支持 RANGE/LIST/HASH 分区 |
+| 分区裁剪 | 查询计划自动排除无关分区 |
+| INSERT OVERWRITE | 不支持，需用 DELETE + INSERT |
+| 事务性写入 | 支持完整事务保证 |
+
+---
+
+## 分区表规范
+
+PostgreSQL 使用原生分区表语法：
+
+```sql
+PARTITION BY RANGE (ds)
+```
+
+### 分区命名
+
+| 类型 | 命名模式 | 示例 |
+|------|----------|------|
+| 主表 | `<table_name>` | `ads_loan_report` |
+| 分区 | `<table_name>_p<日期>` | `ads_loan_report_p20260401` |
+
+---
+
+## DDL 建表规范
+
+### 语法示例
+
+```sql
+CREATE TABLE IF NOT EXISTS schema.table_name
+(
+    col1             VARCHAR
+    ,col2            BIGINT
+    ,ds              VARCHAR
+);
+
+COMMENT ON TABLE schema.table_name IS '表描述';
+COMMENT ON COLUMN schema.table_name.col1 IS '字段1描述';
+COMMENT ON COLUMN schema.table_name.col2 IS '字段2描述';
+COMMENT ON COLUMN schema.table_name.ds IS '分区键，按天分区';
+```
+
+### 关键约束
+
+- **禁止内联注释**：使用 `COMMENT ON` 而非 `COMMENT '...'`
+- **禁止 `STORED AS` 子句**：PostgreSQL 无此语法
+- **禁止 `PARTITIONED BY` 子句**：如需分区，使用原生分区语法 `PARTITION BY RANGE (ds)`
+
+---
+
+## 幂等性实现硬约束
+
+**PostgreSQL 通过 DELETE + INSERT 实现幂等**
+
+### 核心规则
+
+1. 使用 `DELETE` + `INSERT INTO` 实现幂等写入
+2. 目标表需设置 `transactional = true`（如使用 MERGE 需开启）
+3. 推荐使用 `ON CONFLICT DO UPDATE`（UPSERT）处理增量场景
+4. 严禁不带 WHERE 条件的全表 DELETE
+5. **代码整体结构必须按以下顺序排列**：
+   - 第 1 段：`DELETE FROM` 语句单独成段
+   - 第 2 段：`WITH ... AS (...)` 定义所有 CTE
+   - 第 3 段：`INSERT INTO table (...)` 显式指定目标字段列表
+   - 第 4 段：`SELECT ... FROM cte` 从 CTE 查询数据
+   - 第 5 段：分号 `;` 结束语句
+6. **INSERT INTO 必须显式指定字段列表**，禁止 `INSERT INTO table SELECT ...`（防止目标表结构变更导致字段顺序错位）
+7. **INSERT 列列表与 SELECT 列表必须按位置一一对齐**：INSERT 写了哪几列，SELECT 必须按相同顺序写出对应列，不得省略 ds 字段
+
+### 正确示例
+
+```sql
+DELETE FROM target_table WHERE ds = '{prebizdate}';
+
+WITH cte0_refresh_date_scope AS (
+    SELECT
+        '{prebizdate}' AS cur_ds
+        ,TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '1 day', 'YYYYMMDD') AS yesterday_ds
+)
+,cte1_source_data AS (
+    SELECT col1, col2, '{prebizdate}' AS ds
+    FROM source_table
+    WHERE ds = '{prebizdate}'
+)
+INSERT INTO target_table (col1, col2, ds)
+SELECT col1, col2, ds
+FROM cte1_source_data;
+```
+
+> 说明：按 ① DELETE → ② WITH → ③ INSERT INTO → ④ SELECT 的顺序排列，各段以空行分隔。
+
+### 错误示例（禁止）
+
+```sql
+-- 禁止：全表删除
+DELETE FROM target_table;  -- 无 WHERE 条件
+
+-- 禁止：不支持 INSERT OVERWRITE
+INSERT OVERWRITE TABLE target_table ...  -- Hive 语法，PG 不支持
+
+-- 禁止：INSERT INTO 不指定字段列表
+WITH cte AS (...)
+INSERT INTO target_table  -- 缺少 (col1, col2, ds)
+SELECT col1, col2, ds FROM cte;
+```
+
+### 推荐写法（本项目标准格式）
+
+本项目统一使用标准四段式结构，示例如下：
+
+```sql
+DELETE FROM target_table WHERE ds = '{prebizdate}';
+
+WITH cte0_refresh_date_scope AS (
+    SELECT
+        '{prebizdate}' AS cur_ds
+        ,TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '1 day', 'YYYYMMDD') AS yesterday_ds
+)
+,cte1_source_data AS (
+    SELECT col1, col2, '{prebizdate}' AS ds
+    FROM source_table
+    WHERE ds = '{prebizdate}'
+)
+INSERT INTO target_table (col1, col2, ds)
+SELECT col1, col2, ds
+FROM cte1_source_data;
+```
+
+---
+
+## 分区写入策略
+
+PostgreSQL 通过 **DELETE + INSERT** 实现幂等写入。
+
+> **窗口范围、回刷规则**：参见 `sql-standards.mdc` 的"窗口计算规范"章节
+
+### 日维度（每日快照）
+
+日维度按照 sql-standards 的分区策略选择，属于**业务时间分区**（ds = 业务日期），需要覆盖迟到数据，因此本次计算会读取多天窗口、并向多个分区写入。
+
+| 场景 | 读取窗口 | 写入分区 |
+|------|---------|---------|
+| 授信相关 | `[T-2, T]` | 窗口内每个业务日期对应一个分区 |
+| 借款/贷后相关 | `[T-3, T-1]` | 窗口内每个业务日期对应一个分区 |
+
+PostgreSQL 无法像 Hive 那样使用 `PARTITION (ds)` 动态分区，需要通过**循环或批量 DELETE + INSERT** 实现多分区幂等写入。
+
+#### 授信相关日维度
+
+> 窗口 `[T-2, T]`，写入 ds = 业务日期字段值
+
+```sql
+DELETE FROM target_table
+WHERE ds >= TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '2 day', 'YYYYMMDD')
+  AND ds <= '{prebizdate}';
+
+WITH cte0_refresh_date_scope AS (
+    SELECT
+        '{prebizdate}' AS cur_ds
+        ,TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '2 day', 'YYYYMMDD') AS win_start_ds
+)
+
+-- ============================================================================
+-- CTE1：读取授信上游 T-2~T 三天数据
+-- 说明：
+--   1) 数据来源：dws 层表，上游 ds 分区过滤 [T-2, T]
+--   2) 过滤条件：按上游 ds 过滤三天分区
+--   3) 口径：目标 ds 取自业务日期字段，非上游 ds
+-- ============================================================================
+-- 字段格式说明：
+--   ds                    VARCHAR，yyyyMMdd 示例：20260505 目标分区（取自 <授信业务日期字段>）
+--   <授信业务日期字段>    DATE 示例：2026-05-05 授信业务日期（替换为实际字段名）
+
+,cte1_source_data AS (
+    SELECT  col1
+            ,col2
+            ,TO_CHAR(t.<授信业务日期字段>, 'YYYYMMDD') AS ds    -- ds 取自业务日期字段，非上游 ds
+    FROM    source_table t
+    WHERE   t.ds >= TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '2 day', 'YYYYMMDD')
+      AND   t.ds <= '{prebizdate}'
+)
+INSERT INTO target_table (col1, col2, ds)
+SELECT col1, col2, ds
+FROM cte1_source_data;
+```
+
+#### 借款/贷后相关日维度
+
+> 窗口 `[T-3, T-1]`，写入 ds = 业务日期字段值
+
+```sql
+DELETE FROM target_table
+WHERE ds >= TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '3 day', 'YYYYMMDD')
+  AND ds <= TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '1 day', 'YYYYMMDD');
+
+WITH cte0_refresh_date_scope AS (
+    SELECT
+        '{prebizdate}' AS cur_ds
+        ,TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '1 day', 'YYYYMMDD') AS yesterday_ds
+        ,TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '3 day', 'YYYYMMDD') AS win_start_ds
+)
+
+-- ============================================================================
+-- CTE1：读取借款/贷后上游 T-3~T-1 三天数据
+-- 说明：
+--   1) 数据来源：dws 层表，上游 ds 分区过滤 [T-3, T-1]
+--   2) 过滤条件：按上游 ds 过滤三天分区
+--   3) 口径：目标 ds 取自业务日期字段，非上游 ds
+-- ============================================================================
+-- 字段格式说明：
+--   ds                    VARCHAR，yyyyMMdd 示例：20260504 目标分区（取自 <放款/还款业务日期字段>）
+--   <放款/还款业务日期字段>    DATE 示例：2026-05-04 放款/还款业务日期（替换为实际字段名）
+
+,cte1_source_data AS (
+    SELECT  col1
+            ,col2
+            ,TO_CHAR(t.<放款/还款业务日期字段>, 'YYYYMMDD') AS ds    -- ds 取自业务日期字段，非上游 ds
+    FROM    source_table t
+    WHERE   t.ds >= TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '3 day', 'YYYYMMDD')
+      AND   t.ds <= TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '1 day', 'YYYYMMDD')
+)
+INSERT INTO target_table (col1, col2, ds)
+SELECT col1, col2, ds
+FROM cte1_source_data;
+```
+
+#### 与月/周维度的核心区别
+
+| 维度 | 读取窗口 | 写入分区数 | DELETE 范围 | ds 取值 |
+|------|---------|-----------|------------|--------|
+| 日维（授信） | `[T-2, T]` | 多个（窗口内每个业务日期） | 批量 DELETE 窗口内所有分区 | 业务日期字段值 |
+| 日维（借款） | `[T-3, T-1]` | 多个（窗口内每个业务日期） | 批量 DELETE 窗口内所有分区 | 业务日期字段值 |
+| 月/周维度 | 窗口期 | 1 个（当日分区） | DELETE 当日分区 | `{prebizdate}` |
+
+### 月维度（累积型快照）
+
+| 项目 | 实现 |
+|------|------|
+| 写入方式 | DELETE 当前分区 + INSERT 完整结果 |
+| 数据来源 | 窗口新结果 + 历史继承 |
+
+> 代码结构与日维度一致，差异仅在 cte0 和 cteN：
+
+```sql
+DELETE FROM target_table WHERE ds = '{prebizdate}';
+
+WITH cte0_refresh_date_scope AS (
+    SELECT
+        '{prebizdate}' AS cur_ds
+        -- 月维回刷窗口：month_start(T-2)
+        ,TO_CHAR(DATE_TRUNC('month', TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '2 day'), 'YYYYMMDD') AS win_start_ds
+)
+,cteN_full_result AS (
+    -- 按月维窗口过滤：business_date >= month_start(T-2) AND <= T
+    SELECT col1, col2, business_date
+    FROM source_table
+    WHERE business_date >= TO_CHAR(DATE_TRUNC('month', TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '2 day'), 'YYYYMMDD')
+      AND business_date <= '{prebizdate}'
+)
+INSERT INTO target_table (col1, col2, ds)
+SELECT col1, col2, '{prebizdate}' AS ds
+FROM cteN_full_result;
+```
+
+### 周维度（累积型快照）
+
+| 项目 | 实现 |
+|------|------|
+| 写入方式 | DELETE 当前分区 + INSERT 完整结果 |
+| 数据来源 | 窗口新结果 + 历史继承 |
+
+> 代码结构与月维度一致，差异仅在 cte0 中 `win_start_ds` 的计算方式为 `week_start(T-2)`。
+
+## 历史继承模式
+
+PostgreSQL 月/周维度的历史继承通过 **UNION ALL** 实现，外层包装为 `cteN_full_result`：
+
+```sql
+,cteN_full_result AS (
+    -- 窗口新结果
+    SELECT col1, col2, business_date
+    FROM source_table
+    WHERE business_date >= <窗口起始日表达式>
+      AND business_date <= '{prebizdate}'
+
+    UNION ALL
+
+    -- 从历史分区继承窗口外数据
+    SELECT col1, col2, business_date
+    FROM target_table
+    WHERE ds = TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '1 day', 'YYYYMMDD')
+      AND business_date < <窗口起始日表达式>
+)
+```
+
+> **说明**：`cte0_refresh_date_scope` 仅作参数注释用途，实际 WHERE 条件必须使用硬编码表达式。
+
+---
+
+## CTE0 运行参数实现
+
+PostgreSQL 使用单个会话变量 `{prebizdate}`，其他日期在 CTE0 内计算得出。
+
+### 变量声明
+
+| 变量名 | 说明 |
+|--------|------|
+| `{prebizdate}` | 当天业务日期，格式 yyyyMMdd，其他日期由其计算得出 |
+
+### CTE0 实现
+
+```sql
+WITH cte0_refresh_date_scope AS (
+    SELECT
+        '{prebizdate}' AS cur_ds            -- 当前业务日
+        ,TO_CHAR(TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '1 day', 'YYYYMMDD') AS yesterday_ds  -- 前一业务日
+        ,TO_CHAR(DATE_TRUNC('month', TO_DATE('{prebizdate}', 'YYYYMMDD') - INTERVAL '2 day'), 'YYYYMMDD') AS win_start_ds  -- 回刷窗口起始日（月维度）
+)
+```
+
+### 字段格式说明
+
+```
+--   cur_ds              VARCHAR，yyyyMMdd 示例：20260402 当前业务日
+--   yesterday_ds        VARCHAR，yyyyMMdd 示例：20260401 前一业务日
+--   win_start_ds        VARCHAR，yyyyMMdd 示例：20260301 回刷窗口起始日
+```
+
+---
+
+## 快速验收清单（PostgreSQL 特有）
+
+> **审查方法**：对每条检查项，先提取代码中的实际顺序，再与正文中的标准样例逐一对比。
+> **判定规则**：实际顺序与标准样例完全一致 → ✅；不一致 → ❌（需修复）。
+
+---
+
+### PG-1：DELETE + INSERT 幂等模式
+
+**代码实际顺序提取规则**：
+1. 在 DML 部分搜索 `DELETE FROM` 关键字（不在 `--` 注释内）
+2. 判断维度类型：月/周维使用 `WHERE ds = '{prebizdate}'`；日维使用 `WHERE ds >= ... AND ds <= ...` 范围条件
+3. 扫描确认 DELETE 后有对应 INSERT
+
+**判定逻辑**：
+- 月/周维使用 `WHERE ds = '{prebizdate}'` → ✅
+- 日维使用 `WHERE ds >= ... AND ds <= ...` 覆盖窗口内所有分区 → ✅
+- 日维错误使用 `WHERE ds = '{prebizdate}'`（仅删当天） → ❌
+- 存在 `DELETE FROM` 但无 WHERE 条件 → ❌（全表删除，禁止）
+- 不存在 `DELETE FROM` → ❌（缺少幂等保护）
+
+---
+
+### PG-2：日维度多分区写入
+
+**判定逻辑**：
+- DELETE 使用 `WHERE ds >= ... AND ds <= ...` 覆盖窗口内所有分区 → ✅
+- DELETE 使用 `WHERE ds = '{prebizdate}'`（月/周维写法）用于日维表 → ❌
+
+---
+
+### PG-3：DDL 注释语法
+
+**代码实际顺序提取规则**：
+1. 扫描 DDL 部分，提取 `CREATE TABLE` 中的字段列表
+2. 检查字段定义中是否存在内联 `COMMENT '...'` 语法（禁止）
+3. 扫描所有 `COMMENT ON TABLE` 语句，统计出现次数
+4. 扫描所有 `COMMENT ON COLUMN` 语句，统计出现次数
+5. 逐一比对：字段数 = COMMENT ON COLUMN 数 + 1（表级 COMMENT）
+
+**判定逻辑**：
+- 所有字段均使用 `COMMENT ON COLUMN` 而非内联 COMMENT → ✅
+- 任一字段使用内联 `COMMENT '...'` 语法 → ❌（禁止）
+- 表级 COMMENT + 所有字段均有 COMMENT ON COLUMN → ✅
+- 任一字段缺少 COMMENT ON COLUMN → ❌
+
+---
+
+> **通用验收项**：窗口范围、金额口径、分区写入、历史继承 参见 `sql-standards.mdc` 的"快速验收清单"

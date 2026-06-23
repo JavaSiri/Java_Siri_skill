@@ -1,0 +1,53 @@
+---
+description: 需求分析 Workflow - 加载分析器 → 结构化分析 → 输出结论 → 引导进入 to-prd
+---
+
+> **规则激活声明**：本 Workflow 全程激活以下规则，不可绕过：
+> - `.cursor/rules/Datawarehouse/think.mdc`（思维范式，贯穿所有 Step）
+
+---
+
+## Step 1: 加载分析器
+
+读取以下文件：
+
+```
+skill: requirement-analyzer
+规范:
+  - .cursor/rules/Datawarehouse/classifiers/stat-view.mdc（统计视角分类）
+  - .cursor/rules/Datawarehouse/classifiers/time-dimension.mdc（时间维度分类）
+```
+
+---
+
+## Step 2: 执行需求分析
+
+> 前提：Step 1 读取清单已输出
+
+执行 `requirement-analyzer` skill，按 5 个维度结构化分析需求。
+
+```
+输出: 需求分析结论
+  - 业务问题
+  - 分类结果（统计视角 + 时间维度）
+  - 数据来源
+  - 口径确认（待人工决策点）
+```
+
+---
+
+## Step 3: 判断后续路径
+
+> 前提：Step 2 分析结论已输出
+
+根据口径确认结果判断后续路径：
+
+```
+口径确认列表为空：
+  → 所有口径已明确 → 引导进入 to-prd
+
+口径确认列表非空：
+  → 存在未澄清口径点 → 引导进入 grill-with-docs 澄清
+  → 澄清完成后 → 重新执行 Step 2（更新口径确认结果）
+  → 再进入本步判断后续路径
+```

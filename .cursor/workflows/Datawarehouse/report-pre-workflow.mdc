@@ -1,0 +1,86 @@
+---
+description: 报表需求开发主流程 - 指标提取 → 口径澄清 → PRD 起草 → 拆解 Ticket → 分发执行
+---
+
+> **规则激活声明**：本 Workflow 全程激活以下规则，不可绕过：
+> - `.cursor/rules/Datawarehouse/think.mdc`（思维范式，贯穿所有 Step）
+>
+> **编排原则**：本文件是编排层，只声明执行顺序和激活规则。执行逻辑全部委托给 skill，不重抄 skill 内容。
+
+---
+
+## Step 1: 指标提取
+
+> 前提：无
+
+读取 `metric-extractor` skill，执行指标提取。
+
+```
+skill: metric-extractor
+封闭边界: 输出的 JSON 文件路径
+产物: .cursor/knowledge/requirement/{日期戳}_{需求摘要}_metrics.json
+```
+
+---
+
+## Step 2: 口径澄清
+
+> 前提：Step 1 输出的 JSON 文件已生成
+
+读取 `grill-with-docs` skill，执行逐指标追问。
+
+```
+skill: grill-with-docs
+封闭边界: Step 1 输出的指标列表 JSON（status="pending" 的指标为追问范围）
+产物:
+  - .cursor/knowledge/metrics/ 下指标卡片（新增/更新）
+  - .cursor/knowledge/metrics-index.md（指标↔报表映射）
+  - JSON 文件所有 status → "confirmed"
+```
+
+---
+
+## Step 3: 起草 PRD
+
+> 前提：Step 2 所有指标 status="confirmed"
+
+读取 `to-prd` skill，起草并发布业务 PRD。
+
+```
+skill: to-prd
+封闭边界: Step 2 沉淀的指标卡片
+产物: .cursor/issues/{项目编号}-PRD-{序号}-{标题简写}.md
+```
+
+---
+
+## Step 4: 拆解 Ticket
+
+> 前提：Step 3 PRD 已发布
+
+读取 `to_issues` skill，将 PRD 拆解为垂直切片 Ticket。
+
+```
+skill: to_issues
+封闭边界: Step 3 发布的 PRD 文件
+额外激活: stat-view.mdc / time-dimension.mdc（指标分类）
+产物: .cursor/tickets/ 目录下每个切片一个文件
+```
+
+---
+
+## Step 5: 分发执行
+
+> 前提：Step 4 Ticket 列表已持久化
+
+读取 `dispatcher` skill，按 task_type 分发到对应开发 workflow。
+
+```
+skill: dispatcher
+封闭边界: .cursor/tickets/ 目录
+分发规则:
+  - 新建开发 → new-dev.mdc
+  - 调整开发 → modify-dev.mdc
+  - 转译开发 → translate-dev.mdc
+产物: 进入对应开发 workflow
+```

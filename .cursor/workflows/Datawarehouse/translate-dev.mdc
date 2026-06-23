@@ -1,0 +1,59 @@
+---
+description: 转译开发 Workflow - 语法转译 → 代码审查 → 更新 Ticket 状态
+---
+
+> **规则激活声明**：本 Workflow 全程激活以下规则，不可绕过：
+> - `.cursor/rules/Datawarehouse/think.mdc`（思维范式，贯穿所有 Step）
+>
+> 本 Workflow 加载**全部知识资产**（业务知识 + schema 知识），不分阶段。
+
+---
+
+## Step 1: 加载规范
+
+读取以下规范文件：
+
+```
+规范:
+  - .cursor/rules/Datawarehouse/{source_db}-standards.mdc（源数据库规范）
+  - .cursor/rules/Datawarehouse/{target_db}-standards.mdc（目标数据库规范）
+  - .cursor/rules/Datawarehouse/sql-standards.mdc（SQL 通用代码开发规范）
+skill: sql-translate-skill
+```
+
+---
+
+## Step 2: 语法转译
+
+> 前提：Step 1 读取清单已输出
+
+执行 `sql-translate-skill` skill。
+
+```
+输入上下文（来自 Ticket）:
+  - layers（覆盖的层级）
+  - 字段定义表格
+产物: 转译后的 SQL 代码
+```
+
+---
+
+## Step 3: 代码审查
+
+> 前提：Step 2 语法转译完成
+
+```
+返回 dispatcher → 重新分发至 code-review.mdc
+```
+
+---
+
+## Step 4: 返回结果
+
+> 前提：Step 3 代码审查通过
+
+```
+产物:
+  - 最终转译后的 SQL 代码
+  - Ticket status → done
+```

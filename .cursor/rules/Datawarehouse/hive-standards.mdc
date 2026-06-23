@@ -1,0 +1,267 @@
+---
+globs: "**/*.sql"
+description: 提供 Hive SQL 特定的实现方式，包括物理分区表、INSERT OVERWRITE、动态/静态分区规范。适用于编写 Hive SQL 脚本的场景。
+---
+
+# Hive SQL Standards
+
+## 概述
+
+本 Skill 提供 Hive 特定的实现方式，包括物理分区、INSERT OVERWRITE、动态/静态分区规范。
+
+---
+
+## Hive 特性
+
+| 特性 | 说明 |
+|------|------|
+| 分区表 | 物理分区，存储为目录结构 |
+| INSERT OVERWRITE | 覆盖指定分区，天然幂等 |
+| 动态分区 | 根据数据值自动分区 |
+| 静态分区 | 明确指定分区值 |
+
+---
+
+## 物理分区表规范
+
+全部目标表统一使用**物理分区表**：
+
+```sql
+PARTITIONED BY (ds STRING COMMENT '分区字段，格式: yyyyMMdd')
+```
+
+- `ds` 为物理分区字段，不出现在普通列定义中
+- 每个 ds 值对应一个独立的存储目录
+
+---
+
+## DDL 建表规范
+
+### 语法示例
+
+```sql
+CREATE TABLE IF NOT EXISTS schema.table_name
+(
+    col1             STRING COMMENT '字段1描述'
+    ,col2            BIGINT COMMENT '字段2描述'
+)
+COMMENT '表描述'
+PARTITIONED BY (ds STRING COMMENT '分区键，按天分区')
+STORED AS ORC
+;
+```
+
+### 关键约束
+
+- **必须使用 `COMMENT`**：内联在字段定义后，或单独的 `COMMENT '...'` 子句
+- **必须使用 `PARTITIONED BY`**：定义物理分区字段 `ds`
+- **必须使用 `STORED AS`**：推荐 `ORC` 格式
+- `ds` 分区字段**不出现**在普通列定义中
+
+**INSERT 与 SELECT 列对齐规则**：
+- INSERT 列列表与 SELECT 列表必须按位置一一对应
+- **静态分区**（`PARTITION (ds = '{prebizdate}')`）：INSERT 列列表中不写 `ds`，SELECT 列表中也不写 `ds`
+- **动态分区**（`PARTITION (ds)`）：INSERT 列列表中不写 `ds`，但 SELECT 最后一列必须为 `ds`（由分区机制自动读取）
+
+---
+
+## 幂等性实现硬约束
+
+**Hive 通过 `INSERT OVERWRITE PARTITION` 实现幂等**
+
+### 核心规则
+
+1. 统一使用 `INSERT OVERWRITE TABLE <table> PARTITION (ds=...)` 按分区覆盖写入
+2. 严禁使用不带 `PARTITION` 子句的 `INSERT OVERWRITE TABLE <table>`
+3. 严禁使用 `DELETE` 语句
+4. 物理分区表通过 `INSERT OVERWRITE PARTITION` 天然实现幂等
+
+### 正确示例
+
+```sql
+-- 静态分区写入
+INSERT OVERWRITE TABLE target_table PARTITION (ds='{prebizdate}')
+SELECT col1, col2, ...
+FROM source_table
+;
+```
+
+### 错误示例（禁止）
+
+```sql
+-- 禁止：整表覆盖
+INSERT OVERWRITE TABLE target_table
+SELECT ...
+;
+
+-- 禁止：使用 DELETE
+DELETE FROM target_table WHERE ds = '20260401';
+```
+
+---
+
+## 分区写入策略
+
+Hive 通过 **INSERT OVERWRITE PARTITION** 实现幂等写入。
+
+> **窗口范围、回刷规则**：参见 `sql-standards.mdc` 的"窗口计算规范"章节
+
+### 日维度（每日快照）
+
+| 项目 | 实现 |
+|------|------|
+| 写入方式 | 动态分区 |
+| 语法 | `INSERT OVERWRITE TABLE ... PARTITION (ds)` |
+| ds 值来源 | SELECT 最后一列为业务日期字段 |
+
+```sql
+SET hive.exec.dynamic.partition = true;
+SET hive.exec.dynamic.partition.mode = nonstrict;
+
+INSERT OVERWRITE TABLE target_table PARTITION (ds)
+SELECT  col1
+        ,col2
+        ,业务日期字段 AS ds
+FROM    cteN_new_data
+;
+```
+
+### 月维度（累积型快照）
+
+| 项目 | 实现 |
+|------|------|
+| 写入方式 | 静态分区 |
+| 语法 | `INSERT OVERWRITE TABLE ... PARTITION (ds='{prebizdate}')` |
+| 数据来源 | 窗口新结果 + ds=T-1 分区继承历史 |
+
+```sql
+INSERT OVERWRITE TABLE target_table PARTITION (ds='{prebizdate}')
+SELECT  col1
+        ,col2
+        ,...
+FROM    cteN_full_result
+;
+```
+
+### 周维度（累积型快照）
+
+| 项目 | 实现 |
+|------|------|
+| 写入方式 | 静态分区 |
+| 语法 | `INSERT OVERWRITE TABLE ... PARTITION (ds='{prebizdate}')` |
+| 数据来源 | 窗口新结果 + ds=T-1 分区继承历史 |
+
+---
+
+## 历史继承模式
+
+Hive 的历史继承通过 **UNION ALL** 实现：
+
+```sql
+WITH window_result AS (
+    -- 窗口新结果
+    SELECT col1, col2, business_date
+    FROM source_table
+    WHERE business_date >= '${win_start_ds}' AND business_date <= '{prebizdate}'
+),
+history_result AS (
+    -- 从历史分区继承窗口外数据
+    SELECT col1, col2, business_date
+    FROM target_table
+    WHERE ds = '${yesterday_ds}'
+      AND business_date < '${win_start_ds}'
+)
+SELECT * FROM window_result
+UNION ALL
+SELECT * FROM history_result
+```
+
+---
+
+## CTE0 运行参数实现
+
+Hive 使用单个会话变量 `{prebizdate}`，其他日期在 CTE0 内计算得出。
+
+### 变量声明
+
+| 变量名 | 说明 |
+|--------|------|
+| `{prebizdate}` | 当天业务日期，格式 yyyyMMdd，其他日期由其计算得出 |
+
+### CTE0 实现
+
+```sql
+WITH cte0_refresh_date_scope AS (
+    SELECT
+        '{prebizdate}' AS cur_ds            -- 当前业务日
+        ,TO_CHAR(DATE_SUB(TO_DATE('{prebizdate}', 'yyyyMMdd'), 1), 'yyyyMMdd') AS yesterday_ds  -- 前一业务日
+        ,TO_CHAR(TRUNC(TO_DATE('{prebizdate}', 'yyyyMMdd') - 2, 'MM'), 'yyyyMMdd') AS win_start_ds  -- 回刷窗口起始日（月维度）
+)
+```
+
+### 字段格式说明
+
+```
+--   cur_ds              STRING，yyyyMMdd 示例：20260402 当前业务日
+--   yesterday_ds        STRING，yyyyMMdd 示例：20260401 前一业务日
+--   win_start_ds        STRING，yyyyMMdd 示例：20260301 回刷窗口起始日
+```
+
+### 分区裁剪稳定性规则（强制）
+
+**`ds` 分区字段**：必须使用硬编码常量，不得通过 `CROSS JOIN` 引用 CTE0 字段
+- 原因：Hive 优化器无法保证通过 CROSS JOIN 传递的变量能稳定触发分区裁剪
+
+**非分区字段**：可通过 `CROSS JOIN cte0_refresh_date_scope rds` 引用
+- 例如：`WHERE t.business_date >= rds.win_start_ds`
+
+---
+
+## 快速验收清单（Hive 特有）
+
+> **审查方法**：对每条检查项，先提取代码中的实际顺序，再与正文中的标准样例逐一对比。
+> **判定规则**：实际顺序与标准样例完全一致 → ✅；不一致 → ❌（需修复）。
+
+---
+
+### H-1：INSERT OVERWRITE PARTITION 幂等写入
+
+**代码实际顺序提取规则**：
+1. 在 DML 部分搜索 `INSERT OVERWRITE` 关键字
+2. 检查是否紧跟 `PARTITION (ds=...)`
+3. 扫描是否存在 `DELETE FROM` 语句（Hive 不支持）
+
+**判定逻辑**：
+- 使用 `INSERT OVERWRITE TABLE ... PARTITION (ds=...)` → ✅
+- 使用不带 PARTITION 的全表覆盖 → ❌
+- 使用 `DELETE FROM` 语句 → ❌
+
+---
+
+### H-2：动态分区写入（日维度）
+
+**代码实际顺序提取规则**：
+1. 检查是否有 `SET` 语句开启动态分区
+2. 检查 `INSERT OVERWRITE TABLE ... PARTITION (ds)` 中 PARTITION 是否不带 `ds=...`
+3. 检查 SELECT 最后一列是否为日期字段别名 `ds`
+
+**判定逻辑**：
+- 动态分区配置 + `PARTITION (ds)` + SELECT 最后一列为 ds → ✅
+- 静态分区 `PARTITION (ds='...')` 用于日维表 → ❌
+
+---
+
+### H-3：静态分区写入（月/周维度）
+
+**代码实际顺序提取规则**：
+1. 检查 `PARTITION (ds='{prebizdate}')` 是否为静态分区
+2. 检查 SELECT 中是否有 `'${prebizdate}' AS ds` 或 `'{prebizdate}' AS ds`
+3. 检查是否有回刷窗口过滤条件
+
+**判定逻辑**：
+- 静态分区 + ds 取 `{prebizdate}` + 有窗口过滤 → ✅
+- 动态分区用于月/周维表 → ❌
+
+---
+
+> **通用验收项**：窗口范围、金额口径、分区写入、历史继承 参见 `sql-standards.mdc` 的"快速验收清单"
